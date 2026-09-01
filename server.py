@@ -1,47 +1,52 @@
 from flask import Flask, jsonify, send_from_directory
 import requests
-import math
 import time
 import os
 
-app = Flask(__name__, static_folder='.')
+app = Flask(__name__, static_folder=".")
 
-MEXC = 'https://api.mexc.com'
+MEXC = "https://api.mexc.com"
 
 
-def get_kline(symbol):
+def get_json(url, params=None):
     try:
-        url = f'{MEXC}/api/v1/contract/kline/{symbol}'
-        params = {
-            'interval': 'Min5',
-            'limit': 13
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def get_volume_spike(symbol):
+    data = get_json(
+        f"{MEXC}/api/v1/contract/kline/{symbol}",
+        {
+            "interval": "Min5",
+            "limit": 13
         }
+    )
 
-        r = requests.get(url, params=params, timeout=5)
-        data = r.json()
+    if not data or not data.get("success"):
+        return 0, 0
 
-        if not data.get('success'):
-            return None
+    k = data.get("data", {})
 
-        d = data.get('data', {})
+    try:
+        volumes = [float(x) for x in k.get("vol", [])]
+        opens = [float(x) for x in k.get("open", [])]
+        closes = [float(x) for x in k.get("close", [])]
 
-        volumes = d.get('vol', [])
-        opens = d.get('open', [])
-        closes = d.get('close', [])
+        if len(volumes) < 3 or len(opens) < 1 or len(closes) < 1:
+            return 0, 0
 
-        if len(volumes) < 3:
-            return None
+        # آخر شمعة مقارنة بمتوسط الشموع السابقة
+        previous = volumes[:-1]
+        avg_volume = sum(previous) / len(previous)
 
-        volumes = [float(v) for v in volumes]
-        opens = [float(v) for v in opens]
-        closes = [float(v) for v in closes]
+        if avg_volume <= 0:
+            return 0, 0
 
-        avg = sum(volumes[:-1]) / len(volumes[:-1])
-
-        if avg <= 0:
-            return None
-
-        spike = volumes[-1] / avg
+        spike = volumes[-1] / avg_volume
 
         candle_change = 0
 
@@ -51,144 +56,150 @@ def get_kline(symbol):
                 / opens[-1]
             ) * 100
 
-        return {
-            'volume_spike': round(spike, 2),
-            'candle_change': round(candle_change, 3)
-        }
+        return round(spike, 2), round(candle_change, 3)
 
     except Exception:
-        return None
+        return 0, 0
 
 
-def score(x):
-    move = abs(x['pct'])
+def calculate_score(row):
+    score = 0
 
-    move_score = min(move / 3 * 20, 20)
+    # حركة 24 ساعة
+    move = abs(row["pct"])
 
-    volume_score = min(
-        math.log10(max(x['vol'], 1)) / 10 * 20,
-        20
-    )
+    if move >= 10:
+        score += 20
+    elif move >= 5:
+        score += 15
+    elif move >= 3:
+        score += 10
+    elif move >= 1.5:
+        score += 5
 
-    spike = x.get('volume_spike', 0)
+    # Volume Spike
+    spike = row["volume_spike"]
 
     if spike >= 5:
-        spike_score = 45
+        score += 50
     elif spike >= 3:
-        spike_score = 38
+        score += 40
     elif spike >= 2:
-        spike_score = 30
+        score += 30
     elif spike >= 1.5:
-        spike_score = 20
+        score += 20
     elif spike >= 1.2:
-        spike_score = 10
-    else:
-        spike_score = 0
+        score += 10
 
-    candle_score = min(
-        abs(x.get('candle_change', 0)) * 5,
-        20
-    )
+    # حركة شمعة 5 دقائق
+    candle = abs(row["candle_change"])
 
-    return round(
-        min(
-            100,
-            move_score +
-            volume_score +
-            spike_score +
-            candle_score
-        ),
-        1
-    )
+    if candle >= 3:
+        score += 30
+    elif candle >= 2:
+        score += 25
+    elif candle >= 1:
+        score += 15
+    elif candle >= 0.5:
+        score += 8
+
+    return min(score, 100)
 
 
-@app.get('/')
+@app.get("/")
 def home():
-    return send_from_directory('.', 'index.html')
+    return send_from_directory(".", "index.html")
 
 
-@app.get('/api/scan')
+@app.get("/api/scan")
 def scan():
 
-    # Futures contracts
-    contracts = requests.get(
-        f'{MEXC}/api/v1/contract/detail',
-        timeout=10
-    ).json()
+    # 1 — عقود Futures
+    contracts = get_json(
+        f"{MEXC}/api/v1/contract/detail"
+    )
 
-    if not contracts.get('success'):
+    if not contracts or not contracts.get("success"):
         return jsonify(
             ok=False,
-            error='MEXC Futures error'
+            error="MEXC Futures contracts error"
         ), 500
 
-    futures = {
-        c['symbol']
-        for c in contracts.get('data', [])
-        if c.get('quoteCoin') == 'USDT'
-        and c.get('futureType') == 1
-    }
+    futures = set()
 
-    # Futures tickers
-    tickers = requests.get(
-        f'{MEXC}/api/v1/contract/ticker',
-        timeout=10
-    ).json()
+    for c in contracts.get("data", []):
+        if (
+            c.get("quoteCoin") == "USDT"
+            and c.get("futureType") == 1
+            and c.get("state") == 0
+        ):
+            futures.add(c.get("symbol"))
 
-    if not tickers.get('success'):
+    # 2 — Futures ticker
+    tickers = get_json(
+        f"{MEXC}/api/v1/contract/ticker"
+    )
+
+    if not tickers or not tickers.get("success"):
         return jsonify(
             ok=False,
-            error='MEXC ticker error'
+            error="MEXC Futures ticker error"
         ), 500
 
     rows = []
 
-    for x in tickers.get('data', []):
+    for x in tickers.get("data", []):
 
-        symbol = x.get('symbol', '')
+        symbol = x.get("symbol", "")
 
+        # فقط Futures USDT
         if symbol not in futures:
             continue
 
         try:
             rows.append({
-                'symbol': symbol,
-                'price': float(x.get('lastPrice', 0)),
-                'pct': float(x.get('riseFallRate', 0)) * 100,
-                'vol': float(x.get('amount24', 0)),
-                'volume_spike': 0,
-                'candle_change': 0
+                "symbol": symbol,
+                "price": float(x.get("lastPrice", 0)),
+                "pct": float(x.get("riseFallRate", 0)) * 100,
+                "vol": float(x.get("amount24", 0)),
+                "volume_spike": 0,
+                "candle_change": 0,
+                "score": 0
             })
-        except Exception:
-            pass
 
-    # أكبر العملات من حيث التداول
+        except Exception:
+            continue
+
+    # نختار أعلى 10 من ناحية السيولة فقط
+    # حتى ما نضغط Render
     rows.sort(
-        key=lambda x: x['vol'],
+        key=lambda x: x["vol"],
         reverse=True
     )
 
-    # نفحص فقط أفضل 10
     candidates = rows[:10]
 
-    for x in candidates:
+    # فحص Volume Spike فقط للـ10 المرشحين
+    for row in candidates:
 
-        k = get_kline(x['symbol'])
+        spike, candle = get_volume_spike(
+            row["symbol"]
+        )
 
-        if k:
-            x['volume_spike'] = k['volume_spike']
-            x['candle_change'] = k['candle_change']
+        row["volume_spike"] = spike
+        row["candle_change"] = candle
 
-        x['score'] = score(x)
+        row["score"] = calculate_score(row)
 
-    # الباقي يأخذ Score أساسي
-    for x in rows[10:50]:
-        x['score'] = score(x)
+    # باقي العملات تأخذ Score أساسي
+    for row in rows[10:50]:
+        row["score"] = calculate_score(row)
 
     result = rows[:50]
 
+    # ترتيب حسب Score
     result.sort(
-        key=lambda x: x['score'],
+        key=lambda x: x["score"],
         reverse=True
     )
 
@@ -200,10 +211,10 @@ def scan():
 
 
 port = int(
-    os.environ.get('PORT', 8080)
+    os.environ.get("PORT", 8080)
 )
 
 app.run(
-    host='0.0.0.0',
+    host="0.0.0.0",
     port=port
 )
