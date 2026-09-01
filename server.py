@@ -9,17 +9,15 @@ app = Flask(__name__, static_folder='.')
 MEXC = 'https://api.mexc.com'
 
 
-def get_klines(symbol):
+def get_kline(symbol):
     try:
         url = f'{MEXC}/api/v1/contract/kline/{symbol}'
         params = {
             'interval': 'Min5',
-            'start': int(time.time()) - 13 * 5 * 60,
-            'end': int(time.time())
+            'limit': 13
         }
 
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
+        r = requests.get(url, params=params, timeout=5)
         data = r.json()
 
         if not data.get('success'):
@@ -31,34 +29,31 @@ def get_klines(symbol):
         opens = d.get('open', [])
         closes = d.get('close', [])
 
-        if len(volumes) < 2:
+        if len(volumes) < 3:
             return None
 
         volumes = [float(v) for v in volumes]
         opens = [float(v) for v in opens]
         closes = [float(v) for v in closes]
 
-        last_volume = volumes[-1]
-        previous_volumes = volumes[:-1]
+        avg = sum(volumes[:-1]) / len(volumes[:-1])
 
-        avg_volume = sum(previous_volumes) / len(previous_volumes)
-
-        if avg_volume <= 0:
+        if avg <= 0:
             return None
 
-        volume_spike = last_volume / avg_volume
-
-        last_open = opens[-1]
-        last_close = closes[-1]
+        spike = volumes[-1] / avg
 
         candle_change = 0
 
-        if last_open > 0:
-            candle_change = ((last_close - last_open) / last_open) * 100
+        if opens[-1] > 0:
+            candle_change = (
+                (closes[-1] - opens[-1])
+                / opens[-1]
+            ) * 100
 
         return {
-            'volume_spike': volume_spike,
-            'candle_change': candle_change
+            'volume_spike': round(spike, 2),
+            'candle_change': round(candle_change, 3)
         }
 
     except Exception:
@@ -68,16 +63,13 @@ def get_klines(symbol):
 def score(x):
     move = abs(x['pct'])
 
-    # حركة 24 ساعة
     move_score = min(move / 3 * 20, 20)
 
-    # حجم التداول
     volume_score = min(
         math.log10(max(x['vol'], 1)) / 10 * 20,
         20
     )
 
-    # Volume Spike
     spike = x.get('volume_spike', 0)
 
     if spike >= 5:
@@ -93,18 +85,21 @@ def score(x):
     else:
         spike_score = 0
 
-    # حركة آخر 5 دقائق
-    candle_move = abs(x.get('candle_change', 0))
-    candle_score = min(candle_move * 5, 20)
-
-    total = (
-        move_score +
-        volume_score +
-        spike_score +
-        candle_score
+    candle_score = min(
+        abs(x.get('candle_change', 0)) * 5,
+        20
     )
 
-    return round(min(100, total), 1)
+    return round(
+        min(
+            100,
+            move_score +
+            volume_score +
+            spike_score +
+            candle_score
+        ),
+        1
+    )
 
 
 @app.get('/')
@@ -115,121 +110,98 @@ def home():
 @app.get('/api/scan')
 def scan():
 
-    # جلب جميع عقود MEXC Futures
-    contracts_response = requests.get(
+    # Futures contracts
+    contracts = requests.get(
         f'{MEXC}/api/v1/contract/detail',
-        timeout=15
-    )
+        timeout=10
+    ).json()
 
-    contracts_response.raise_for_status()
-
-    contracts_data = contracts_response.json()
-
-    if not contracts_data.get('success'):
+    if not contracts.get('success'):
         return jsonify(
             ok=False,
-            error='فشل جلب عقود Futures من MEXC'
+            error='MEXC Futures error'
         ), 500
 
-    contracts = contracts_data.get('data', [])
+    futures = {
+        c['symbol']
+        for c in contracts.get('data', [])
+        if c.get('quoteCoin') == 'USDT'
+        and c.get('futureType') == 1
+    }
 
-    # فقط عقود USDT الدائمة
-    futures_symbols = set()
-
-    for c in contracts:
-
-        symbol = c.get('symbol', '')
-
-        quote = c.get('quoteCoin', '')
-        future_type = c.get('futureType')
-
-        if (
-            quote == 'USDT'
-            and future_type == 1
-            and symbol
-        ):
-            futures_symbols.add(symbol)
-
-    # جلب بيانات Futures
-    ticker_response = requests.get(
+    # Futures tickers
+    tickers = requests.get(
         f'{MEXC}/api/v1/contract/ticker',
-        timeout=15
-    )
+        timeout=10
+    ).json()
 
-    ticker_response.raise_for_status()
-
-    ticker_data = ticker_response.json()
-
-    if not ticker_data.get('success'):
+    if not tickers.get('success'):
         return jsonify(
             ok=False,
-            error='فشل جلب بيانات Futures'
+            error='MEXC ticker error'
         ), 500
 
-    tickers = ticker_data.get('data', [])
+    rows = []
 
-    out = []
-
-    for x in tickers:
+    for x in tickers.get('data', []):
 
         symbol = x.get('symbol', '')
 
-        # نتأكد أن العملة Futures USDT فعلاً
-        if symbol not in futures_symbols:
+        if symbol not in futures:
             continue
 
         try:
-
-            price = float(x.get('lastPrice', 0))
-            pct = float(x.get('riseFallRate', 0)) * 100
-
-            # amount24 = قيمة التداول خلال 24 ساعة
-            vol = float(x.get('amount24', 0))
-
-            row = {
+            rows.append({
                 'symbol': symbol,
-                'price': price,
-                'pct': pct,
-                'vol': vol,
+                'price': float(x.get('lastPrice', 0)),
+                'pct': float(x.get('riseFallRate', 0)) * 100,
+                'vol': float(x.get('amount24', 0)),
                 'volume_spike': 0,
                 'candle_change': 0
-            }
-
+            })
         except Exception:
-            continue
+            pass
 
-        # فحص شموع 5 دقائق
-        k = get_klines(symbol)
+    # أكبر العملات من حيث التداول
+    rows.sort(
+        key=lambda x: x['vol'],
+        reverse=True
+    )
+
+    # نفحص فقط أفضل 10
+    candidates = rows[:10]
+
+    for x in candidates:
+
+        k = get_kline(x['symbol'])
 
         if k:
+            x['volume_spike'] = k['volume_spike']
+            x['candle_change'] = k['candle_change']
 
-            row['volume_spike'] = round(
-                k['volume_spike'], 2
-            )
+        x['score'] = score(x)
 
-            row['candle_change'] = round(
-                k['candle_change'], 3
-            )
+    # الباقي يأخذ Score أساسي
+    for x in rows[10:50]:
+        x['score'] = score(x)
 
-        row['score'] = score(row)
+    result = rows[:50]
 
-        out.append(row)
-
-    # ترتيب حسب Score
-    out.sort(
-        key=lambda z: z['score'],
+    result.sort(
+        key=lambda x: x['score'],
         reverse=True
     )
 
     return jsonify(
         ok=True,
         time=int(time.time()),
-        rows=out[:50]
+        rows=result
     )
 
 
-# Render PORT
-port = int(os.environ.get('PORT', 8080))
+port = int(
+    os.environ.get('PORT', 8080)
+)
 
 app.run(
     host='0.0.0.0',
