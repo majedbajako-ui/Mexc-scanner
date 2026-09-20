@@ -3,7 +3,7 @@ import requests
 import time
 import os
 
-app = Flask(**name**, static_folder=".")
+app = Flask(__name__, static_folder=".")
 
 MEXC = "https://api.mexc.com"
 
